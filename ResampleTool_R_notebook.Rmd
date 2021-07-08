@@ -22,44 +22,50 @@ For more details on the products, please see the description and Product User Ma
 
 
 
-# Step 2: Reading in the data and dealing with invalid (no-data) pixels
+# Step 2: Reading in the data
 
-Once the data set is available, *raster* package functionality is used to prepare it for resampling. The use of the *knitr* package is optional, it only helps with pretty-printing tables.
+Once the data set is available, *ncdf4* and *raster* packages functionalities are used to prepare it for resampling. Raw digital numbers (DN) stored in the netCFD files are used in order to avoid floating point imprecisions when scaling the values into real physical values (PV). R uses IEEE-754-Standard double-precision floating-point numbers, whereas the values in the netCDF are stored as float32. DN values can be scaled into PV aftewards using the formula PV = DN \* *scale* + *offset*.
+
+The use of the *knitr* package is optional, it only helps with pretty-printing tables.
 
 ```{r}
-library(raster)
+if(require(ncdf4) == FALSE){install.packages("ncdf4", repos = "https://cloud.r-project.org"); library(ncdf4)} else {library(ncdf4)}
+if(require(raster) == FALSE){install.packages("raster", repos = "https://cloud.r-project.org"); library(raster)} else {library(raster)}
 if(require(knitr) == FALSE){install.packages("knitr", repos = "https://cloud.r-project.org"); library(knitr)} else {library(knitr)}
 
-# ndvi_files is a list of the available files (netCFD or Raster* objects)
-ndvi_files <- list(paste0(getwd(), "/ndvi300m_Cat_kk.tif"))
-r <- raster(ndvi_files[[1]])
+# ndvi_files is a list of the available files (Raster* objects or netCDF)
+ndvi_files <- list(paste0(getwd(), "/ndvi300m_Cat.tif"))
 ```
 
+&nbsp;
 
-The original Global Land product files typically come in two flavours: the global netCDF4 files (the native production format) or GeoTIFF subsets. Both can contain specific values (flags) for invalid pixels, which need to be dealt with. For this example, we’ll convert those into NoData (NA) values.
-
-The range of valid pixel values, the scale factor and offset and any flag values used are described in the product documentation and netCDF file metadata.
-
-For your convenience, a short table was prepared summarizing the range of valid values, both in raw digital number (DN) and physical value, for each product, version and data layer. Let’s read in this table from the csv file. 
-
-The physical or real value is computed as digital number * scale + offset, but this applies only for valid pixels.
-
-```{r echo = FALSE}
-cutoff_method_df <- read.csv(paste0(getwd(), "/Table_cutoff_and_resampleMethod.csv"),
-                             stringsAsFactors = FALSE,
-                             header = TRUE)
-kable(cutoff_method_df[, 1:8], caption = "")
-```
-
-For example, in the 300m NDVI products, digital values > 250 are flagged and need to be converted into NA. When netCDF files are read in as a *Raster*\* object, the digital values are scaled into real NDVI values automatically. To make sure to not use any of the invalid (flagged) pixels, we’ll have to be set all pixels with > 0.92 (=DN 250 x scale + offset) to NA.
-
-
+The original Global Land product files typically come in two flavours: the global netCDF4 files (the native production format) or GeoTIFF subsets. If the file is a GeoTIFF:
 ```{r}
-cutoff_flag <- 0.92
-
-r[r > cutoff_flag] <- NA
+if (grepl(".tif$", ndvi_files[[1]])){  
+  r <- raster(ndvi_files[[1]])
+}
 ```
 
+&nbsp;
+
+If the file is a netCDF4:
+```{r}
+if (grepl(".nc$", ndvi_files[[1]])){
+  nc  <- nc_open(ndvi_files[[1]])
+  lon <- ncvar_get(nc, "lon")
+  lat <- ncvar_get(nc, "lat")
+  #Copernicus nc files have lat/long belonging to the centre of the pixel, and R uses upper/left corner;
+  #therefore, coordinates need to be adjusted
+  lon <- lon - (1/336)/2                                   # 1/336 is the pixel resolution of the 333m product
+  lat <- lat + (1/336)/2
+  nc_data <- ncvar_get(nc, "NDVI", raw_datavals = TRUE)    # raw_datavals = TRUE to avoid automatic scaling of DN
+  r <- raster(t(nc_data[, seq(dim(nc_data)[2], 1, -1)]))   # creating a raster object
+  extent(r) <- c(range(lon)[1], (range(lon)[2] + (1/336)),
+                 (range(lat)[1] - (1/336)), range(lat)[2]) # extent of the product 
+  crs(r) <- CRS('+init=EPSG:4326')                         # coordinate reference system
+}
+```
+**Note:**  *raster::raster()* can also read *nc* files (using *ncdf4* functionalities), but Digital Numbers are automatically scaled to physical values. As said before, we want to avoid this because of floating point imprecisions.
 
 
 # Step 3: Checking the geographic extent and raster cropping
@@ -77,7 +83,7 @@ This determines the next steps and raster cropping to be performed, so let’s t
 
 ## Option 1: resampling an entire global 300m raster
 
-**Note:**  File formats like netCDF4 and GeoTIFF can be optimized for reading or storing large rasters through chunking and compression. Take care when reading in such a full global raster in your computer’s working memory in one go. A global 300m raster has 120960 columns and 47040 rows, or close to 5.7bn cells. The size in bytes of each cell is provided in the CSV file (column Bytes per Cell; see table above). Consider working in subsets or using parallel computing techniques (rasterOptions, cluster processing, etc.), as described [here](https://strimas.com/post/processing-large-rasters-in-r/).
+**Note:**  File formats like netCDF4 and GeoTIFF can be optimized for reading or storing large rasters through chunking and compression. Take care when reading in such a full global raster in your computer’s working memory in one go. A global 300m raster has 120960 columns and 47040 rows, or close to 5.7bn cells. The size in bytes of each cell is provided in the CSV file (column Bytes per Cell; see table below). Consider working in subsets or using parallel computing techniques (rasterOptions, cluster processing, etc.), as described [here](https://strimas.com/post/processing-large-rasters-in-r/).
 
 Given the grid definition of the global 300m and 1km products (see image below), no proper aggregation of the finer resolution product can be performed at the minimum and maximum latitude and longitude. For this reason, the 300m *RasterLayer* object needs to be cropped accordingly.
 
@@ -155,7 +161,57 @@ if(!all(round(my_extent[1], 7) %in% round(x_ext, 7) &
 ```
 
 
-# Step 4: Resampling using the aggregation approach
+
+# Step 4: Dealing with invalid (no-data) pixels
+
+The original Global Land product can contain specific values (flags) for invalid pixels, which need to be dealt with. For this example, we’ll convert those into NoData (NA) values.
+
+The range of valid pixel values, the scale factor and offset and any flag values used are described in the product documentation and netCDF file metadata.
+
+For your convenience, a short table was prepared summarizing the range of valid values, both in raw digital number (DN) and physical value, for each product, version and data layer. Let’s read in this table from the csv file. 
+
+
+```{r echo = FALSE}
+cutoff_method_df <- read.csv(paste0(getwd(), "/Table_cutoff_and_resampleMethod.csv"),
+                             stringsAsFactors = FALSE,
+                             header = TRUE)
+kable(cutoff_method_df[, 1:8], caption = "")
+```
+
+As an example, in the 300m NDVI products, digital values > 250 are flagged and need to be converted into NA. 
+
+
+```{r}
+cutoff_flag <- 250
+
+r[r > cutoff_flag] <- NA
+```
+
+&nbsp;
+
+Now we can scale the digital numbers into physical values. As said before, the physical or real value is computed as digital number * scale + offset, but this applies only for valid pixels.
+
+
+```{r}
+if (exists("nc")){
+  # Retrieving scale factor and offset from netCDF metadata
+  scale_fact <- nc$var$NDVI$scaleFact  
+  offset_val <- nc$var$NDVI$addOffset
+}else{
+  # They can be set manually as well
+  scale_fact <- 0.00400000018998981   # double-precision floating-point
+  offset_val <- -0.07999999821186066
+}
+
+r <- r * scale_fact + offset_val
+r  # To check that the values are correctly scaled (e.g. for NDVI between -0.08 and 0.92)
+
+```
+
+&nbsp;
+
+
+# Step 5: Resampling using the aggregation approach
 
 There are several approaches to resample data to a coarser resolution. The area-based aggregation methods group rectangular areas of cells of the finer resolution image to create a new map with larger cells. 
 
@@ -169,7 +225,7 @@ The following table recommends the best suited method for each product/layer.
 kable(cutoff_method_df[, c(1:3, 9)], caption = "")
 ```
 
-**Note:** *QFLAG cannot be resampled due to the different implementations for 1km-v2 and 300m-v1 products.
+**Note:** Resampled QFLAG, LENGTH_BEFORE/AFTER and NOBS cannot be compared to the 1km products due to different implementations for 1km-v2 and 300m-v1 products. For example, LAI-NOBS ranges are 0-120 for 1km-v2 and 0-40 for 300m-v1, or LAI/FAPAR/FCOVER-LENGTH_BEFORE go up to 60 days and up to 210 days, respectively for both products.
 
 Now the process of resampling itself can go ahead using *aggregate()*. The resample method can be assigned at this point.
 
@@ -225,11 +281,13 @@ r300m_resampled1km_Aggr <- aggregate(r,
                                      fun = aggr_method, 
                                      na.rm = TRUE, 
                                      filename = '')
+
+# Only when working with Digital Numbers (not in physical values):
+# r300m_resampled1km_Aggr <- round(r300m_resampled1km_Aggr)
 ```
 
 
-
-# Step 5: Check the outcome and final remarks
+# Step 6: Check the outcome and final remarks
 
 Here are a couple of plots in case the user wants to take a look at the resampled map.
 
@@ -244,4 +302,4 @@ plot(r300m_resampled1km_Aggr, main = 'Resampled map to 1km')
 
 In addition, you could apply the chosen resample method on older (non-near real time) 300m products and correlate the results with the 1km product of the same period.
 
-This document provides the results of such comparisons between 1km-resampled and 1km-produced data layers.
+[This](https://github.com/xavi-rp/ResampleTool_notebook/blob/master/Resample_Report_v2.5.pdf) document provides the results of such comparisons between 1km-resampled and 1km-produced data layers.
